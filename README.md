@@ -1,5 +1,7 @@
 # my-tg-bot
 
+Виконав Месевра Олександр
+
 To install dependencies:
 
 ```bash
