@@ -1,33 +1,45 @@
-import { Bot, session, Context, SessionFlavor } from "grammy";
+import { Bot, session, Context, SessionFlavor, Keyboard } from "grammy";
+import { Database } from "bun:sqlite";
 
-// 1. ОПИСУЄМО "БЛОКНОТ" БОТА (Session)
-// Це те, що бот буде пам'ятати для кожного користувача
+// ==========================================
+// ІНІЦІАЛІЗАЦІЯ БАЗИ ДАНИХ
+// ==========================================
+const db = new Database("bot.db");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    telegram_id INTEGER PRIMARY KEY, age INTEGER, weight INTEGER,
+    height INTEGER, sex TEXT, activity_level REAL, bmr REAL, tdee REAL
+  );
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS meals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+    raw_text TEXT, calories_estimated INTEGER, timestamp TEXT
+  );
+`);
+
+// ==========================================
+// НАЛАШТУВАННЯ БОТА ТА СЕСІЙ
+// ==========================================
 interface SessionData {
-  step: "idle" | "waiting_age" | "waiting_height" | "waiting_weight" | "waiting_sex" | "waiting_activity";
+  // Додали крок "waiting_delete_id"
+  step: "idle" | "waiting_age" | "waiting_height" | "waiting_weight" | "waiting_sex" | "waiting_activity" | "waiting_meal_name" | "waiting_meal_calories" | "waiting_delete_id";
   age?: number;
   height?: number;
   weight?: number;
   sex?: "male" | "female";
   activity?: number;
+  tempMealName?: string;
 }
 
-// Розширюємо стандартний контекст бота нашими сесіями
 type MyContext = Context & SessionFlavor<SessionData>;
-
 const bot = new Bot<MyContext>(process.env.BOT_TOKEN || "");
-
-// Ініціалізуємо сесію (за замовчуванням бот нічого не чекає - стан "idle")
 bot.use(session({ initial: (): SessionData => ({ step: "idle" }) }));
 
-// ==========================================
-// ПУНКТ 1: ФОРМУЛИ
-// ==========================================
 function calculateBMR(weight: number, height: number, age: number, sex: string): number {
-  if (sex === "male") {
-    return 10 * weight + 6.25 * height - 5 * age + 5;
-  } else {
-    return 10 * weight + 6.25 * height - 5 * age - 161;
-  }
+  return sex === "male" ? 10 * weight + 6.25 * height - 5 * age + 5 : 10 * weight + 6.25 * height - 5 * age - 161;
 }
 
 function calculateTDEE(bmr: number, activity: number): number {
@@ -35,131 +47,184 @@ function calculateTDEE(bmr: number, activity: number): number {
 }
 
 // ==========================================
-// ПУНКТ 2: КОМАНДА /set_profile (Початок опитування)
+// БАЗОВІ КОМАНДИ
 // ==========================================
-bot.command("set_profile", (ctx) => {
-  ctx.session.step = "waiting_age"; // Перемикаємо бота в режим очікування віку
-  ctx.reply("Давай налаштуємо твій профіль! 📝\nКрок 1: Введи свій вік (цифрою, наприклад: 25):");
+bot.command("start", (ctx) => {
+  ctx.session.step = "idle";
+  ctx.reply("Привіт! Я бот-дієтолог 🍏 з ідеальною пам'яттю.\n\nКоманди:\n/set_profile - Налаштувати профіль\n/my_profile - Мої дані\n/add_meal - Записати їжу\n/today - Що я сьогодні їв\n/delete_meal - Видалити запис");
 });
 
-// ==========================================
-// ПУНКТ 5: КОМАНДА /my_profile (Показати дані)
-// ==========================================
-bot.command("my_profile", (ctx) => {
-  const s = ctx.session;
-  if (!s.age || !s.height || !s.weight || !s.sex || !s.activity) {
-    ctx.reply("Твій профіль ще не заповнений! Напиши /set_profile");
+bot.command("set_profile", (ctx) => {
+  ctx.session.step = "waiting_age";
+  ctx.reply("Давай налаштуємо твій профіль! 📝\nКрок 1: Введи свій вік:", { reply_markup: { remove_keyboard: true } });
+});
+
+bot.command("add_meal", (ctx) => {
+  ctx.session.step = "waiting_meal_name";
+  ctx.reply("Що ви їли? 🍽️ (напишіть текстом, наприклад: 2 яйця і тост)", { reply_markup: { remove_keyboard: true } });
+});
+
+// НОВА КОМАНДА: ВИДАЛЕННЯ ЇЖІ
+bot.command("delete_meal", (ctx) => {
+  ctx.session.step = "waiting_delete_id";
+  ctx.reply("Введи ID прийому їжі, який хочеш видалити 🗑️\n(Свій ID можна знайти в списку /today):", { reply_markup: { remove_keyboard: true } });
+});
+
+bot.command("today", (ctx) => {
+  const userId = ctx.from?.id;
+  const todayPrefix = new Date().toISOString().split('T')[0]; 
+  
+  // Тепер ми витягуємо ще й `id` з бази даних
+  const getMeals = db.query("SELECT id, raw_text, calories_estimated, timestamp FROM meals WHERE user_id = ? AND timestamp LIKE ?");
+  const meals = getMeals.all(userId, `${todayPrefix}%`) as any[];
+
+  if (meals.length === 0) {
+    ctx.reply("Сьогодні ще немає записаних прийомів їжі 🤷‍♂️");
     return;
   }
 
-  const bmr = calculateBMR(s.weight, s.height, s.age, s.sex);
-  const tdee = calculateTDEE(bmr, s.activity);
+  let response = "📅 **Сьогодні ви зʼїли:**\n\n";
+  let totalCal = 0;
+
+  meals.forEach((meal, index) => {
+    const time = new Date(meal.timestamp).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' });
+    // Додаємо відображення ID у список
+    response += `${index + 1}. [${time}] 🍲 ${meal.raw_text} (${meal.calories_estimated} kcal) — ID: ${meal.id}\n`;
+    totalCal += meal.calories_estimated;
+  });
+
+  response += `\n**Всього:** ${totalCal} kcal 🔥\n\n💡 Помилилися? Напишіть /delete_meal`;
+  ctx.reply(response);
+});
+
+bot.command("my_profile", (ctx) => {
+  const userId = ctx.from?.id;
+  const getUser = db.query("SELECT * FROM users WHERE telegram_id = ?");
+  const user = getUser.get(userId) as any;
+
+  if (!user) {
+    ctx.reply("Твій профіль ще не знайдено в базі! Напиши /set_profile");
+    return;
+  }
 
   ctx.reply(
-    `📊 **Твій профіль:**\n` +
-    `Вік: ${s.age} років\n` +
-    `Зріст: ${s.height} см\n` +
-    `Вага: ${s.weight} кг\n` +
-    `Стать: ${s.sex}\n` +
-    `Активність: ${s.activity}\n\n` +
-    `🔥 **Твої показники:**\n` +
-    `Базовий обмін речовин (BMR): ${Math.round(bmr)} ккал\n` +
-    `Денна норма калорій (TDEE): ${Math.round(tdee)} ккал`
+    `📊 **Твій збережений профіль:**\n` +
+    `Вік: ${user.age} | Зріст: ${user.height} см | Вага: ${user.weight} кг\n` +
+    `Стать: ${user.sex} | Активність: ${user.activity_level}\n\n` +
+    `🔥 BMR: ${Math.round(user.bmr)} ккал\n` +
+    `🏃‍♂️ TDEE: ${Math.round(user.tdee)} ккал`
   );
 });
 
 // ==========================================
-// ПУНКТ 3 ТА 4: ОБРОБКА ТЕКСТУ ТА ВАЛІДАЦІЯ
+// ОБРОБКА ТЕКСТУ ТА ЗБЕРЕЖЕННЯ В БД
 // ==========================================
 bot.on("message:text", (ctx) => {
   const text = ctx.message.text.trim().toLowerCase();
+  const originalText = ctx.message.text.trim();
   const step = ctx.session.step;
+  const userId = ctx.from.id;
 
-  // Якщо бот нічого не чекає, просто вітаємось
   if (step === "idle") {
-    ctx.reply("Напиши /set_profile, щоб почати розрахунок калорій, або /my_profile, щоб подивитися результати.");
+    ctx.reply("Використай меню команд зліва від поля вводу, щоб керувати ботом 🤖");
     return;
   }
 
-  // КРОК 1: Отримуємо ВІК
+  // ЛОГІКА ВИДАЛЕННЯ З БАЗИ
+  if (step === "waiting_delete_id") {
+    const mealId = parseInt(text);
+    if (isNaN(mealId)) return ctx.reply("❌ Помилка! Введи коректний числовий ID (наприклад: 5):");
+    
+    // Видаляємо лише той запис, який належить саме цьому користувачу (безпека!)
+    const deleteMeal = db.query("DELETE FROM meals WHERE id = ? AND user_id = ?");
+    const result = deleteMeal.run(mealId, userId);
+    
+    ctx.session.step = "idle";
+    
+    // result.changes показує, скільки рядків було видалено з таблиці
+    if (result.changes > 0) {
+      ctx.reply(`Запис успішно видалено! 🗑️✅\nПеревір оновлений список: /today`);
+    } else {
+      ctx.reply(`❌ Запис з таким ID не знайдено. Перевір правильність у списку: /today`);
+    }
+    return;
+  }
+
+  // ЗАПИС ЇЖІ (Назва -> Калорії)
+  if (step === "waiting_meal_name") {
+    ctx.session.tempMealName = originalText;
+    ctx.session.step = "waiting_meal_calories";
+    ctx.reply(`Ти з'їв(ла): "${originalText}".\nСкільки калорій у цій порції? 🔢 (напиши просто число, наприклад: 350)`);
+    return;
+  }
+
+  if (step === "waiting_meal_calories") {
+    const calories = parseInt(text);
+    if (isNaN(calories) || calories < 0) return ctx.reply("❌ Помилка! Введи коректне число калорій:");
+    
+    const insertMeal = db.query("INSERT INTO meals (user_id, raw_text, calories_estimated, timestamp) VALUES (?, ?, ?, ?)");
+    const timestamp = new Date().toISOString(); 
+    
+    insertMeal.run(userId, ctx.session.tempMealName, calories, timestamp);
+    
+    ctx.session.step = "idle";
+    ctx.session.tempMealName = undefined; 
+    ctx.reply("Прийом їжі та калорії збережено ✅\nМожеш перевірити список командою /today");
+    return;
+  }
+
+  // ПРОФІЛЬ (Вік -> Зріст -> Вага -> Стать -> Активність)
   if (step === "waiting_age") {
     const age = parseInt(text);
-    if (isNaN(age) || age < 10 || age > 100) {
-      ctx.reply("❌ Помилка! Вік має бути числом від 10 до 100. Спробуй ще раз:");
-      return;
-    }
-    ctx.session.age = age;
-    ctx.session.step = "waiting_height"; // Перемикаємо на наступний крок
-    ctx.reply("✅ Збережено! Крок 2: Введи свій зріст у сантиметрах (від 100 до 250):");
-    return;
-  }
-
-  // КРОК 2: Отримуємо ЗРІСТ
-  if (step === "waiting_height") {
+    if (isNaN(age) || age < 10 || age > 100) return ctx.reply("❌ Помилка! Введи число від 10 до 100:");
+    ctx.session.age = age; ctx.session.step = "waiting_height"; ctx.reply("✅ Зріст у см (від 100 до 250):");
+  } 
+  else if (step === "waiting_height") {
     const height = parseInt(text);
-    if (isNaN(height) || height < 100 || height > 250) {
-      ctx.reply("❌ Помилка! Зріст має бути числом від 100 до 250. Спробуй ще раз:");
-      return;
-    }
-    ctx.session.height = height;
-    ctx.session.step = "waiting_weight";
-    ctx.reply("✅ Збережено! Крок 3: Введи свою вагу в кілограмах (від 30 до 300):");
-    return;
-  }
-
-  // КРОК 3: Отримуємо ВАГУ
-  if (step === "waiting_weight") {
+    if (isNaN(height) || height < 100 || height > 250) return ctx.reply("❌ Помилка! Від 100 до 250:");
+    ctx.session.height = height; ctx.session.step = "waiting_weight"; ctx.reply("✅ Вага в кг (від 30 до 300):");
+  } 
+  else if (step === "waiting_weight") {
     const weight = parseInt(text);
-    if (isNaN(weight) || weight < 30 || weight > 300) {
-      ctx.reply("❌ Помилка! Вага має бути числом від 30 до 300. Спробуй ще раз:");
-      return;
-    }
-    ctx.session.weight = weight;
-    ctx.session.step = "waiting_sex";
-    ctx.reply("✅ Збережено! Крок 4: Введи свою стать (напиши 'male' для чоловіка або 'female' для жінки):");
-    return;
-  }
+    if (isNaN(weight) || weight < 30 || weight > 300) return ctx.reply("❌ Помилка! Від 30 до 300:");
+    ctx.session.weight = weight; ctx.session.step = "waiting_sex"; 
+    
+    const sexKeyboard = new Keyboard().text("male").text("female").resized().oneTime();
+    ctx.reply("✅ Вага збережена! Обери свою стать (натисни кнопку):", { reply_markup: sexKeyboard });
+  } 
+  else if (step === "waiting_sex") {
+    if (text !== "male" && text !== "female") return ctx.reply("❌ Натисни кнопку male або female:");
+    ctx.session.sex = text; ctx.session.step = "waiting_activity"; 
+    
+    const activityKeyboard = new Keyboard()
+      .text("low").text("light").row() 
+      .text("medium").text("high").resized().oneTime();
+    
+    ctx.reply("✅ Стать збережена! Обери рівень активності (натисни кнопку):", { reply_markup: activityKeyboard });
+  } 
+  else if (step === "waiting_activity") {
+    let activity = 0;
+    if (text === "low") activity = 1.2; else if (text === "light") activity = 1.375;
+    else if (text === "medium") activity = 1.55; else if (text === "high") activity = 1.725;
+    else return ctx.reply("❌ Обери кнопку: low, light, medium, high:");
 
-  // КРОК 4: Отримуємо СТАТЬ
-  if (step === "waiting_sex") {
-    if (text !== "male" && text !== "female") {
-      ctx.reply("❌ Помилка! Напиши чітко: male або female.");
-      return;
-    }
-    ctx.session.sex = text;
-    ctx.session.step = "waiting_activity";
-    ctx.reply("✅ Збережено! Останній крок!\nОбери свій рівень активності (напиши слово):\n- low (низький)\n- light (легкий)\n- medium (середній)\n- high (високий)");
-    return;
-  }
-
-  // КРОК 5: Отримуємо АКТИВНІСТЬ і рахуємо результат
-  if (step === "waiting_activity") {
-    let activityMultiplier = 0;
-    if (text === "low") activityMultiplier = 1.2;
-    else if (text === "light") activityMultiplier = 1.375;
-    else if (text === "medium") activityMultiplier = 1.55;
-    else if (text === "high") activityMultiplier = 1.725;
-    else {
-      ctx.reply("❌ Помилка! Обери один із варіантів: low, light, medium, high.");
-      return;
-    }
-
-    ctx.session.activity = activityMultiplier;
-    ctx.session.step = "idle"; // Опитування завершено!
-
-    // Рахуємо і відправляємо результати (ПУНКТ 3)
     const bmr = calculateBMR(ctx.session.weight!, ctx.session.height!, ctx.session.age!, ctx.session.sex!);
-    const tdee = calculateTDEE(bmr, activityMultiplier);
+    const tdee = calculateTDEE(bmr, activity);
 
-    ctx.reply(
-      `🎉 **Профіль успішно налаштовано!**\n\n` +
-      `🔥 Твій BMR (Базовий обмін): ${Math.round(bmr)} ккал/день\n` +
-      `🏃‍♂️ Твій TDEE (З урахуванням активності): ${Math.round(tdee)} ккал/день\n\n` +
-      `Ти завжди можеш переглянути свої дані командою /my_profile`
-    );
-    return;
+    const insertOrUpdateUser = db.query(`
+      INSERT INTO users (telegram_id, age, weight, height, sex, activity_level, bmr, tdee)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(telegram_id) DO UPDATE SET
+        age=excluded.age, weight=excluded.weight, height=excluded.height,
+        sex=excluded.sex, activity_level=excluded.activity_level, bmr=excluded.bmr, tdee=excluded.tdee
+    `);
+
+    insertOrUpdateUser.run(userId, ctx.session.age, ctx.session.weight, ctx.session.height, ctx.session.sex, activity, bmr, tdee);
+    ctx.session.step = "idle";
+
+    ctx.reply(`🎉 **Дані збережено в базу!**\nТепер я пам'ятатиму тебе навіть після перезапуску.\n\nТвій TDEE: ${Math.round(tdee)} ккал/день.`, { reply_markup: { remove_keyboard: true } });
   }
 });
 
-console.log("🍏 Калорійний Бот запускається...");
+console.log("💾 Бот з базою даних запускається...");
 bot.start();
